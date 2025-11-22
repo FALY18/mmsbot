@@ -21,8 +21,8 @@ from instagrapi.exceptions import (
 # ======================
 # CONFIG TELEGRAM (à adapter si besoin)
 # ======================
-API_ID = 21297856 # <-- Mets ton api_id
-API_HASH = "8a3d43dd2986184eb75aecc220b735d3" # <-- Mets ton api_hash
+API_ID = 21297856
+API_HASH = "8a3d43dd2986184eb75aecc220b735d3"
 BOT_USERNAME = "@SmmKingdomTasksBot"
 
 # ======================
@@ -32,10 +32,7 @@ MAX_RETRIES = 3
 REQUEST_DELAY = (0.5, 1.5)
 ACTION_DELAY = (0.5, 2.0)
 MAX_TASKS_PER_ACCOUNT = 20
-
-# Fenêtre pour accepter "tâches existantes" au démarrage (en secondes).
 EXISTING_TASK_WINDOW_SECONDS = 120
-
 LAST_ACCOUNT_FILE = "last_account.txt"
 
 # ======================
@@ -53,7 +50,6 @@ except json.JSONDecodeError:
 
 INSTA_PASSWORDS = {a["username"]: a["password"] for a in INSTA_ACCOUNTS}
 INSTA_SESSIONS: dict[str, InstaClient] = {}
-
 SKIP_ACCOUNTS: dict[str, float] = {}
 SKIP_DURATION = 3600
 
@@ -140,16 +136,15 @@ async def get_recent_messages(client: TelegramClient, bot: str, limit: int = 10)
 # ======================
 # EMOJI DETECTION HELPERS
 # ======================
-# Pattern Unicode pour détecter la plupart des émojis
 _EMOJI_RE = re.compile(
     "[" +
-    "\U0001F300-\U0001F5FF"  # symbols & pictographs
-    "\U0001F600-\U0001F64F"  # emoticons
-    "\U0001F680-\U0001F6FF"  # transport & map
-    "\U0001F1E0-\U0001F1FF"  # flags
-    "\U00002700-\U000027BF"  # dingbats
-    "\U00002600-\U000026FF"  # misc symbols
-    "\U0001F900-\U0001F9FF"  # supplemental symbols and pictographs
+    "\U0001F300-\U0001F5FF" +
+    "\U0001F600-\U0001F64F" +
+    "\U0001F680-\U0001F6FF" +
+    "\U0001F1E0-\U0001F1FF" +
+    "\U00002700-\U000027BF" +
+    "\U00002600-\U000026FF" +
+    "\U0001F900-\U0001F9FF" +
     "]+", flags=re.UNICODE
 )
 
@@ -160,15 +155,9 @@ def contains_emoji(s: str) -> bool:
 
 
 # ======================
-# Collecte rapide du texte de commentaire (maintenant accepte emoji-only)
+# Collecte rapide du texte de commentaire
 # ======================
 async def fast_collect_comment_text(client: TelegramClient, bot: str, after_id: int, timeout_sec: int = 20) -> Optional[str]:
-    """
-    Cherche le texte de commentaire envoyé APRES le message d'ID after_id.
-    Accepte:
-      - texte contenant des lettres/chiffres
-      - texte constitué uniquement d'émojis (même 1 emoji)
-    """
     start = time.time()
     while time.time() - start < timeout_sec:
         recent_messages = await get_recent_messages(client, bot, 10)
@@ -186,12 +175,9 @@ async def fast_collect_comment_text(client: TelegramClient, bot: str, after_id: 
             if any(x in low for x in ["http", "www.", "instagram.com/p/", "link", "action", "reward", "cashcoins"]):
                 continue
 
-            # Accept if contains normal word characters (text) OR contains emoji
             if re.search(r"\w", body) or contains_emoji(body):
                 print(f"✅ Texte de commentaire trouvé (next message id {msg.id}): {body}")
                 return body
-
-            # Otherwise ignore (likely a control line or something irrelevant)
         await asyncio.sleep(0.4)
     print("❌ Timeout: Texte de commentaire non trouvé")
     return None
@@ -213,10 +199,6 @@ def normalize_instagram_profile(link: str) -> str:
 
 
 def parse_task_message(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Retourne (action, link, comment_text_inline) si trouvés.
-    Le inline comment accepte maintenant aussi des petits contenus s'ils sont des émojis.
-    """
     if not text:
         return None, None, None
     if is_thankyou_message(text):
@@ -245,10 +227,8 @@ def parse_task_message(text: str) -> Tuple[Optional[str], Optional[str], Optiona
             comment_match = re.search(pattern, text, re.IGNORECASE)
             if comment_match:
                 candidate = comment_match.group(1).strip()
-                # Ignorer username apparent
                 if candidate.startswith('@'):
                     continue
-                # Accept small candidate IF it contains emoji; otherwise require >=3 chars
                 if len(candidate) >= 3 or contains_emoji(candidate):
                     comment_text = candidate
                     print(f"✅ Texte de commentaire extrait (inline): {comment_text}")
@@ -303,7 +283,7 @@ def load_last_account() -> Optional[str]:
 
 
 # ======================
-# SESSIONS INSTAGRAM
+# SESSIONS INSTAGRAM - CORRECTION PRINCIPALE
 # ======================
 def get_ig_session(username: str) -> Optional[InstaClient]:
     if username in SKIP_ACCOUNTS:
@@ -323,13 +303,11 @@ def get_ig_session(username: str) -> Optional[InstaClient]:
         print(f"❌ Aucun mot de passe pour {username}")
         return None
 
-    cl = InstaClient()
     try:
-        cl.set_locale("fr_FR")
-        cl.set_country("FR")
-        cl.set_country_code(33)
-        cl.set_timezone_offset(3600)
-        cl.set_device({
+        cl = InstaClient()
+        
+        # Configuration robuste pour éviter l'erreur 'version_code'
+        device_settings = {
             "app_version": "200.0.0.30.128",
             "android_version": 26,
             "android_release": "8.0.0",
@@ -338,17 +316,39 @@ def get_ig_session(username: str) -> Optional[InstaClient]:
             "manufacturer": "samsung",
             "device": "SM-G935F",
             "model": "herolte",
-            "cpu": "samsungexynos8890"
-        })
-        try:
-            cl.load_settings(f"session_{username}.json")
-        except:
-            pass
+            "cpu": "samsungexynos8890",
+            "version_code": "2000030128"  # Ajout du version_code manquant
+        }
+        
+        cl.set_device(device_settings)
+        cl.set_locale("fr_FR")
+        cl.set_country("FR")
+        cl.set_country_code(33)
+        cl.set_timezone_offset(3600)
+        
+        # User agent personnalisé pour éviter le formatage problématique
+        user_agent = (
+            "Instagram 200.0.0.30.128 Android (26/8.0.0; 480dpi; 1080x1920; "
+            "samsung; SM-G935F; herolte; samsungexynos8890; fr_FR)"
+        )
+        cl.set_user_agent(user_agent)
+        
+        # Chargement de la session existante
+        session_file = f"session_{username}.json"
+        if os.path.exists(session_file):
+            try:
+                cl.load_settings(session_file)
+                print(f"✅ Session chargée pour {username}")
+            except Exception as e:
+                print(f"⚠️ Impossible de charger la session {username}: {e}")
+        
+        # Tentative de connexion
         cl.login(username, pwd)
-        cl.dump_settings(f"session_{username}.json")
+        cl.dump_settings(session_file)
         INSTA_SESSIONS[username] = cl
         print(f"✅ Connecté à Instagram: {username}")
         return cl
+        
     except (ChallengeRequired, PleaseWaitFewMinutes) as e:
         print(f"❌ Challenge/Wait pour {username}: {e}")
         handle_instagram_error(username, e)
@@ -365,6 +365,7 @@ def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: O
         try:
             a_low = (action or "").lower()
             time.sleep(random.uniform(*ACTION_DELAY))
+            
             if "follow" in a_low:
                 target = normalize_instagram_profile(link)
                 if not target:
@@ -387,13 +388,13 @@ def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: O
                         print(f"❌ Follow fallback erreur: {e2}")
                         return False
 
-            if "like" in a_low:
+            elif "like" in a_low:
                 media_pk = cl.media_pk_from_url(link)
                 cl.media_like(media_pk)
                 print(f"❤️ Like réussi (pk={media_pk})")
                 return True
 
-            if "comment" in a_low or "leave the comment" in a_low:
+            elif "comment" in a_low or "leave the comment" in a_low:
                 media_pk = cl.media_pk_from_url(link)
                 text = (comment_text or "").strip()
                 if not text:
@@ -403,8 +404,9 @@ def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: O
                 print(f"💬 Commentaire posté: {text[:140]}")
                 return True
 
-            print(f"⚠️ Action inconnue: {action}")
-            return False
+            else:
+                print(f"⚠️ Action inconnue: {action}")
+                return False
 
         except FeedbackRequired as e:
             print(f"❌ FeedbackRequired: {e}")
@@ -431,7 +433,7 @@ def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: O
 
 
 # ======================
-# Recherche du bloc tâche précédent (entre baseline_id et after_msg_id)
+# Recherche du bloc tâche précédent
 # ======================
 async def find_prev_task_before_message(
     client: TelegramClient,
@@ -491,7 +493,6 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
 
             print(f"✅ Tâche existante détectée (ID: {msg.id})")
 
-            # chercher username envoyé avant la tâche (entre prompt et la tâche)
             username_found = None
             async for prev in client.iter_messages(BOT_USERNAME, limit=30, max_id=msg.id - 1):
                 if not prev.message:
@@ -564,7 +565,6 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
 # Process per account
 # ======================
 async def process_account(client: TelegramClient, username: str, use_tasks_command: bool) -> bool:
-    # envoyer menu si demandé
     if use_tasks_command:
         ok = await send_with_retry(client, BOT_USERNAME, "📝Tasks📝")
         if not ok:
@@ -573,7 +573,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         print("➡️ Envoyé: 📝Tasks📝")
         await asyncio.sleep(0.8)
 
-    # baseline avant 'Instagram'
     try:
         baseline_list = await client.get_messages(BOT_USERNAME, limit=1)
         baseline_id = baseline_list[0].id if baseline_list else 0
@@ -582,7 +581,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         baseline_id = 0
     print(f"📌 Baseline ID: {baseline_id}")
 
-    # envoyer Instagram (toujours)
     ok = await send_with_retry(client, BOT_USERNAME, "Instagram")
     if not ok:
         print("❌ Impossible d'envoyer 'Instagram'")
@@ -590,14 +588,12 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
     print("➡️ Envoyé: Instagram")
     await asyncio.sleep(0.8)
 
-    # envoyer username
     sent_username_ok = await send_with_retry(client, BOT_USERNAME, username)
     if not sent_username_ok:
         print(f"❌ Impossible d'envoyer username {username}")
         return False
     print(f"➡️ Sélection du compte: {username}")
 
-    # attendre réponse : 5s -> réessayer (resend username) -> wait 10s -> sinon next account
     response = await wait_next_bot_message(client, BOT_USERNAME, baseline_id, timeout_sec=5)
     if not response:
         print(f"⚠️ Pas de réponse après 5s suite à envoi username {username} -> réessai dans 10s")
@@ -608,7 +604,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             print(f"⚠️ Toujours pas de réponse après réessai -> on sort de ce compte")
             return False
 
-    # récupérer messages après baseline_id
     try:
         msgs = []
         async for m in client.iter_messages(BOT_USERNAME, limit=80, min_id=baseline_id + 1):
@@ -653,17 +648,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
 
         action, link, comment_text_from_message = parse_task_message(text)
 
-        # (option) recherche du bloc précédent pour associer commentaire isolé
-        # Cette section est volontairement laissée commentée car dans certaines config
-        # elle générait des faux-positifs en inventant des tâches. Réactive si désiré.
-        # if not action and not link:
-        #     prev_task = await find_prev_task_before_message(client, BOT_USERNAME, last_msg.id, baseline_id=baseline_id, lookback=60, require_comment=True)
-        #     if prev_task:
-        #         ...
-        #     else:
-        #         return False
-
-        # si action+link -> exécuter (possiblement comment)
         if action and link:
             comment_text = None
             if "comment" in action.lower() or "leave the comment" in action.lower():
@@ -702,7 +686,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             last_msg = nxt
             continue
 
-        # cas défaut -> attendre suivant
         nxt = await wait_next_bot_message(client, BOT_USERNAME, last_msg.id, timeout_sec=10)
         if not nxt:
             print("ℹ️ Rien de pertinent reçu -> sortie du compte")
@@ -729,6 +712,7 @@ async def initialize_instagram_sessions():
             continue
         print(f"🔗 Connexion à Instagram: {username}")
         get_ig_session(username)
+        await asyncio.sleep(1)  # Delai entre les connexions
     print(f"✅ {len(INSTA_SESSIONS)} sessions Instagram initialisées")
 
 
@@ -749,13 +733,11 @@ async def main():
 
     await initialize_instagram_sessions()
 
-    # vérifier tâches existantes au démarrage
     task_processed = await check_existing_tasks(client)
 
     idx = 0
     consecutive_errors = 0
     max_errors_before_pause = 3
-    # si on a traité une tâche existante -> on commence directement par "Instagram" sans renvoyer "📝Tasks📝"
     use_tasks_command = not task_processed
 
     try:
