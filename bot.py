@@ -54,11 +54,11 @@ SKIP_ACCOUNTS: dict[str, float] = {}
 SKIP_DURATION = 3600
 
 # ======================
-# SOLUTION DEFINITIVE POUR L'ERREUR version_code
+# SOLUTION CORRIGÉE POUR L'ERREUR version_code
 # ======================
 class PatchedInstaClient(InstaClient):
     """
-    Client Instagram patché pour contourner l'erreur version_code
+    Client Instagram patché avec correction de l'ordre des opérations
     """
     def set_user_agent(self, user_agent: str = ""):
         """
@@ -304,7 +304,7 @@ def load_last_account() -> Optional[str]:
 
 
 # ======================
-# SESSIONS INSTAGRAM - SOLUTION DEFINITIVE
+# SESSIONS INSTAGRAM - CORRECTION DE L'ORDRE DES OPÉRATIONS
 # ======================
 def get_ig_session(username: str) -> Optional[PatchedInstaClient]:
     if username in SKIP_ACCOUNTS:
@@ -328,7 +328,20 @@ def get_ig_session(username: str) -> Optional[PatchedInstaClient]:
         # Utilisation du client patché
         cl = PatchedInstaClient()
         
-        # Configuration minimale pour éviter les erreurs
+        # D'ABORD charger la session existante
+        session_file = f"session_{username}.json"
+        session_loaded = False
+        
+        if os.path.exists(session_file):
+            try:
+                cl.load_settings(session_file)
+                print(f"✅ Session chargée pour {username}")
+                session_loaded = True
+            except Exception as e:
+                print(f"⚠️ Impossible de charger la session {username}: {e}")
+        
+        # ENSUITE configurer le device et user agent
+        # (même si la session est chargée, on veut notre configuration)
         device_settings = {
             "app_version": "200.0.0.30.128",
             "android_version": 26,
@@ -347,29 +360,41 @@ def get_ig_session(username: str) -> Optional[PatchedInstaClient]:
         cl.set_country_code(33)
         cl.set_timezone_offset(3600)
         
-        # User agent fixe défini dans la classe patchée
-        # Pas besoin d'appeler set_user_agent() car il est déjà défini dans __init__
+        # User agent fixe - important après set_device
+        user_agent = (
+            "Instagram 200.0.0.30.128 Android (26/8.0.0; 480dpi; 1080x1920; "
+            "samsung; SM-G935F; herolte; samsungexynos8890; fr_FR; 2000030128)"
+        )
+        cl.set_user_agent(user_agent)
         
-        # Chargement de la session existante
-        session_file = f"session_{username}.json"
-        if os.path.exists(session_file):
-            try:
-                cl.load_settings(session_file)
-                print(f"✅ Session chargée pour {username}")
-            except Exception as e:
-                print(f"⚠️ Impossible de charger la session {username}: {e}")
+        # Si aucune session n'était chargée, on fait le login complet
+        if not session_loaded:
+            print(f"🔐 Connexion complète pour {username}")
+            cl.login(username, pwd)
         
-        # Tentative de connexion
-        cl.login(username, pwd)
+        # Sauvegarder la session (mise à jour ou création)
         cl.dump_settings(session_file)
         INSTA_SESSIONS[username] = cl
-        print(f"✅ Connecté à Instagram: {username}")
+        print(f"✅ Session Instagram active: {username}")
         return cl
         
     except (ChallengeRequired, PleaseWaitFewMinutes) as e:
         print(f"❌ Challenge/Wait pour {username}: {e}")
         handle_instagram_error(username, e)
         return None
+    except LoginRequired as e:
+        print(f"🔐 Session expirée pour {username}, reconnexion...")
+        try:
+            # Tentative de reconnexion avec mot de passe
+            cl.login(username, pwd)
+            cl.dump_settings(session_file)
+            INSTA_SESSIONS[username] = cl
+            print(f"✅ Reconnexion réussie: {username}")
+            return cl
+        except Exception as relogin_error:
+            print(f"❌ Échec reconnexion {username}: {relogin_error}")
+            handle_instagram_error(username, relogin_error)
+            return None
     except Exception as e:
         print(f"❌ Erreur connexion IG {username}: {e}")
         handle_instagram_error(username, e)
