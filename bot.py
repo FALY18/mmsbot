@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import json
 import re
@@ -5,7 +6,7 @@ import time
 import random
 import os
 from urllib.parse import urlparse
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime
 
 from telethon import TelegramClient
@@ -18,10 +19,10 @@ from instagrapi.exceptions import (
 )
 
 # ======================
-# CONFIG TELEGRAM
+# CONFIG TELEGRAM (à adapter si besoin)
 # ======================
-API_ID = 21297856 # <-- Mets ton api_id
-API_HASH = "8a3d43dd2986184eb75aecc220b735d3" # <-- Mets ton api_hash
+API_ID = 21297856  # <-- Mets ton api_id
+API_HASH = "8xxxxxxxxxxxxxxxx20b735d3"  # <-- Mets ton api_hash
 BOT_USERNAME = "@SmmKingdomTasksBot"
 
 # ======================
@@ -33,11 +34,10 @@ ACTION_DELAY = (0.5, 2.0)
 MAX_TASKS_PER_ACCOUNT = 20
 
 # Fenêtre pour accepter "tâches existantes" au démarrage (en secondes).
-# Si 0 => on acceptera toutes les tâches existantes; sinon on n'accepte que
-# celles datant de <= EXISTING_TASK_WINDOW_SECONDS
 EXISTING_TASK_WINDOW_SECONDS = 120
 
 LAST_ACCOUNT_FILE = "last_account.txt"
+STATE_FILE = "state.json"
 
 # ======================
 # CHARGEMENT COMPTES IG
@@ -53,10 +53,44 @@ except json.JSONDecodeError:
     raise SystemExit(1)
 
 INSTA_PASSWORDS = {a["username"]: a["password"] for a in INSTA_ACCOUNTS}
-INSTA_SESSIONS: dict[str, InstaClient] = {}
+INSTA_SESSIONS: Dict[str, InstaClient] = {}
 
 SKIP_ACCOUNTS: dict[str, float] = {}
 SKIP_DURATION = 3600
+
+# persistent state for tasks/accounts to avoid skipping/reprocessing
+STATE: Dict[str, Any] = {
+    "accounts": {}  # username -> { last_msg_id, skip_until, consecutive_errors }
+}
+
+
+# ======================
+# STATE PERSISTENCE
+# ======================
+def load_state():
+    global STATE
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                STATE = json.load(f)
+        except Exception:
+            STATE = {"accounts": {}}
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(STATE, f)
+    except Exception as e:
+        print(f"⚠️ Impossible de sauvegarder l'état: {e}")
+
+
+def ensure_account_state(username: str):
+    acc = STATE.setdefault("accounts", {})
+    if username not in acc:
+        acc[username] = {"last_msg_id": 0, "skip_until": 0, "consecutive_errors": 0}
+    return acc[username]
+
 
 # ======================
 # UTILITAIRES TELEGRAM
@@ -73,7 +107,7 @@ def is_thankyou_message(text: str) -> bool:
         r"félicitations",
         r"your balance has been replenished with \d+\.?\d* cashcoins",
         r"thank you for completing the task: leave the comment",
-        r"link : https://www\.instagram\.com/p/",
+        r"link : https?://www\.instagram\.com/p/",
     ]
     return any(re.search(p, t) for p in patterns)
 
@@ -109,7 +143,7 @@ async def send_with_retry(client: TelegramClient, entity: str, message: str, max
         except Exception as e:
             print(f"⚠️ Erreur envoi Telegram (tentative {attempt+1}): {e}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 * (attempt + 1))
+                await asyncio.sleep(2 ** attempt)
     return False
 
 
@@ -138,6 +172,32 @@ async def get_recent_messages(client: TelegramClient, bot: str, limit: int = 10)
         return []
 
 
+# ======================
+# EMOJI DETECTION HELPERS
+# ======================
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F1E0-\U0001F1FF"
+    "\U00002700-\U000027BF"
+    "\U00002600-\U000026FF"
+    "\U0001F900-\U0001F9FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def contains_emoji(s: str) -> bool:
+    if not s:
+        return False
+    return bool(_EMOJI_RE.search(s))
+
+
+# ======================
+# Collecte rapide du texte de commentaire (maintenant accepte emoji-only)
+# ======================
 async def fast_collect_comment_text(client: TelegramClient, bot: str, after_id: int, timeout_sec: int = 20) -> Optional[str]:
     start = time.time()
     while time.time() - start < timeout_sec:
@@ -152,11 +212,11 @@ async def fast_collect_comment_text(client: TelegramClient, bot: str, after_id: 
                 continue
             if body in {"Instagram", "📝Tasks📝", "🔙Back", "✅Completed", "❌Skip"} or body.startswith('@'):
                 continue
-            if (len(body) > 3 and
-                not any(x in body.lower() for x in ["http", "www.", "instagram.com/p/", "link", "action", "reward", "cashcoins"]) and
-                not re.search(r"▪️\s*\w+", body) and
-                not "no active tasks" in body.lower()):
-                print(f"✅ Texte de commentaire trouvé: {body[:120]}")
+            low = body.lower()
+            if any(x in low for x in ["http", "www.", "instagram.com/p/", "link", "action", "reward", "cashcoins"]):
+                continue
+            if re.search(r"\w", body) or contains_emoji(body):
+                print(f"✅ Texte de commentaire trouvé (next message id {msg.id}): {body}")
                 return body
         await asyncio.sleep(0.4)
     print("❌ Timeout: Texte de commentaire non trouvé")
@@ -187,10 +247,10 @@ def parse_task_message(text: str) -> Tuple[Optional[str], Optional[str], Optiona
         return None, None, None
 
     action_match = re.search(r"(?:^|\n)\s*(?:▪️\s*)?(action|task)\s*[:\-]\s*([^\n]+)", text, re.IGNORECASE)
-    link_match   = re.search(r"(?:^|\n)\s*(?:▪️\s*)?(link|url)\s*[:\-]\s*([^\s]+)",  text, re.IGNORECASE)
+    link_match = re.search(r"(?:^|\n)\s*(?:▪️\s*)?(link|url)\s*[:\-]\s*([^\s]+)", text, re.IGNORECASE)
 
     action = action_match.group(2).strip() if action_match else None
-    link   = link_match.group(2).strip() if link_match else None
+    link = link_match.group(2).strip() if link_match else None
 
     if link and not link.startswith(("http://", "https://", "@")):
         link = f"https://instagram.com/{link.lstrip('@')}"
@@ -207,9 +267,11 @@ def parse_task_message(text: str) -> Tuple[Optional[str], Optional[str], Optiona
             comment_match = re.search(pattern, text, re.IGNORECASE)
             if comment_match:
                 candidate = comment_match.group(1).strip()
-                if not candidate.startswith('@') and len(candidate) > 2:
+                if candidate.startswith('@'):
+                    continue
+                if len(candidate) >= 3 or contains_emoji(candidate):
                     comment_text = candidate
-                    print(f"✅ Texte de commentaire extrait (inline): {comment_text[:120]}")
+                    print(f"✅ Texte de commentaire extrait (inline): {comment_text}")
                     break
     return action, link, comment_text
 
@@ -219,18 +281,24 @@ def parse_task_message(text: str) -> Tuple[Optional[str], Optional[str], Optiona
 # ======================
 def handle_instagram_error(username: str, error: Exception) -> bool:
     error_msg = str(error).lower()
-    if any(x in error_msg for x in ["challenge", "phone", "sms", "verify", "confirmation"]):
-        print(f"❌ Challenge requis pour {username} - skip 1h")
-        SKIP_ACCOUNTS[username] = time.time()
+    acc_state = ensure_account_state(username)
+    # on challenge ou vérification -> skip durable
+    if any(x in error_msg for x in ["challenge", "phone", "sms", "verify", "confirmation", "checkpoint"]):
+        skip_until = time.time() + SKIP_DURATION
+        acc_state["skip_until"] = skip_until
+        save_state()
+        print(f"❌ Challenge requis pour {username} - skip jusqu'à {datetime.utcfromtimestamp(skip_until)}")
         return False
-    if any(x in error_msg for x in ["wait", "minutes", "temporarily", "temporary"]):
-        print(f"⏳ Attente requise pour {username} - skip 1h")
-        SKIP_ACCOUNTS[username] = time.time()
+    # throttling / wait messages -> backoff + skip short
+    if any(x in error_msg for x in ["wait", "minutes", "temporarily", "temporary", "try again later"]):
+        acc_state["skip_until"] = time.time() + 300  # 5 minutes
+        save_state()
+        print(f"⏳ Attente requise pour {username} - skip 5 minutes")
         return False
     if any(x in error_msg for x in ["problem with your request", "request", "connection", "network"]):
         print(f"⚠️ Problème réseau pour {username} - réessayer plus tard")
         return True
-    print(f"⚠️ Erreur IG inconnue pour {username} - réessayer plus tard")
+    print(f"⚠️ Erreur IG inconnue pour {username}: {error_msg[:120]} - réessayer plus tard")
     return True
 
 
@@ -240,6 +308,15 @@ def cleanup_skip_list():
     for a in expired:
         del SKIP_ACCOUNTS[a]
         print(f"✅ Compte {a} retiré des skipés")
+    # aussi nettoyer state skip_until expirés
+    changed = False
+    for user, st in STATE.get("accounts", {}).items():
+        if st.get("skip_until", 0) and current_time > st["skip_until"]:
+            st["skip_until"] = 0
+            changed = True
+            print(f"✅ Compte {user} retiré du skip persistant")
+    if changed:
+        save_state()
 
 
 def save_last_account(username: str):
@@ -264,6 +341,13 @@ def load_last_account() -> Optional[str]:
 # SESSIONS INSTAGRAM
 # ======================
 def get_ig_session(username: str) -> Optional[InstaClient]:
+    acc_state = ensure_account_state(username)
+    # check persistent skip
+    if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
+        remaining = int((acc_state["skip_until"] - time.time()) / 60)
+        print(f"⏭️ Compte {username} skipé (persistant, {remaining} minutes restants)")
+        return None
+
     if username in SKIP_ACCOUNTS:
         skip_time = SKIP_ACCOUNTS[username]
         if time.time() - skip_time < SKIP_DURATION:
@@ -317,12 +401,12 @@ def get_ig_session(username: str) -> Optional[InstaClient]:
         return None
 
 
-def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: Optional[str]) -> bool:
+async def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: Optional[str]) -> bool:
     print(f"🛠️ Tentative d'action: {action} sur {link}")
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             a_low = (action or "").lower()
-            time.sleep(random.uniform(*ACTION_DELAY))
+            await asyncio.sleep(random.uniform(*ACTION_DELAY))
             if "follow" in a_low:
                 target = normalize_instagram_profile(link)
                 if not target:
@@ -343,6 +427,8 @@ def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: O
                         return True
                     except Exception as e2:
                         print(f"❌ Follow fallback erreur: {e2}")
+                        # certain errors indicate account problems
+                        handle_instagram_error(getattr(cl, "username", "unknown"), e2)
                         return False
 
             if "like" in a_low:
@@ -367,23 +453,29 @@ def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: O
         except FeedbackRequired as e:
             print(f"❌ FeedbackRequired: {e}")
             if attempt == 0:
-                time.sleep(3)
+                await asyncio.sleep(3)
+                continue
             else:
                 return False
         except PleaseWaitFewMinutes as e:
             print(f"❌ PleaseWaitFewMinutes: {e}")
+            handle_instagram_error(getattr(cl, "username", "unknown"), e)
             return False
         except ClientConnectionError as e:
             print(f"❌ ClientConnectionError: {e}")
             if attempt == 0:
-                time.sleep(2)
+                await asyncio.sleep(2 ** attempt)
+                continue
             else:
                 return False
         except Exception as e:
             print(f"❌ Erreur action IG: {e}")
             if attempt == 0:
-                time.sleep(1)
+                await asyncio.sleep(1)
+                continue
             else:
+                # escalate unknown errors to handler to possibly mark skip
+                handle_instagram_error(getattr(cl, "username", "unknown"), e)
                 return False
     return False
 
@@ -401,7 +493,6 @@ async def find_prev_task_before_message(
 ) -> Optional[Message]:
     try:
         msgs = []
-        # itérateurs: min_id = baseline_id + 1, max_id = after_msg_id - 1
         async for m in client.iter_messages(bot, limit=lookback, min_id=baseline_id + 1, max_id=after_msg_id - 1):
             msgs.append(m)
         if not msgs:
@@ -450,7 +541,7 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
 
             print(f"✅ Tâche existante détectée (ID: {msg.id})")
 
-            # chercher username envoyé avant la tâche (entre prompt et la tâche)
+            # essayer d'identifier le compte lié
             username_found = None
             async for prev in client.iter_messages(BOT_USERNAME, limit=30, max_id=msg.id - 1):
                 if not prev.message:
@@ -461,7 +552,7 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
                         body2 = (later.message or "").strip()
                         if not body2:
                             continue
-                        if body2 in { "Instagram", "📝Tasks📝", "🔙Back", "✅Completed", "❌Skip" }:
+                        if body2 in {"Instagram", "📝Tasks📝", "🔙Back", "✅Completed", "❌Skip"}:
                             continue
                         if body2 in INSTA_PASSWORDS:
                             username_found = body2
@@ -495,12 +586,16 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
                 await send_with_retry(client, BOT_USERNAME, "❌Skip")
                 continue
 
-            ok = do_instagram_action(cl, action, link, comment_text)
+            ok = await do_instagram_action(cl, action, link, comment_text)
             if ok:
                 await send_with_retry(client, BOT_USERNAME, "✅Completed")
                 print("✅ Completed envoyé pour la tâche existante")
                 save_last_account(username_found)
                 any_processed = True
+                # update persistent state: last_msg_id processed
+                acc = ensure_account_state(username_found)
+                acc["last_msg_id"] = max(acc.get("last_msg_id", 0), msg.id)
+                save_state()
 
                 nxt = await wait_next_bot_message(client, BOT_USERNAME, msg.id, timeout_sec=8)
                 if nxt and looks_like_task_block(nxt.message or ""):
@@ -523,6 +618,13 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
 # Process per account
 # ======================
 async def process_account(client: TelegramClient, username: str, use_tasks_command: bool) -> bool:
+    acc_state = ensure_account_state(username)
+    # skip if persistent skip_until in future
+    if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
+        remaining = int((acc_state["skip_until"] - time.time()) / 60)
+        print(f"⏭️ Compte {username} skipé (persistant, {remaining} minutes restants)")
+        return False
+
     # envoyer menu si demandé
     if use_tasks_command:
         ok = await send_with_retry(client, BOT_USERNAME, "📝Tasks📝")
@@ -532,13 +634,18 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         print("➡️ Envoyé: 📝Tasks📝")
         await asyncio.sleep(0.8)
 
-    # baseline avant 'Instagram'
+    # baseline avant 'Instagram' - utiliser last_msg_id si présent pour éviter reprocess
     try:
         baseline_list = await client.get_messages(BOT_USERNAME, limit=1)
         baseline_id = baseline_list[0].id if baseline_list else 0
     except Exception as e:
         print(f"⚠️ Erreur récupération baseline id: {e}")
         baseline_id = 0
+
+    # If we have a saved last_msg_id, use it as baseline to not reprocess older messages
+    saved_last = acc_state.get("last_msg_id", 0)
+    if saved_last and saved_last > baseline_id:
+        baseline_id = saved_last
     print(f"📌 Baseline ID: {baseline_id}")
 
     # envoyer Instagram (toujours)
@@ -565,6 +672,8 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         response = await wait_next_bot_message(client, BOT_USERNAME, baseline_id, timeout_sec=10)
         if not response:
             print(f"⚠️ Toujours pas de réponse après réessai -> on sort de ce compte")
+            acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
+            save_state()
             return False
 
     # récupérer messages après baseline_id
@@ -574,6 +683,8 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             msgs.append(m)
     except Exception as e:
         print(f"⚠️ Erreur récupération messages: {e}")
+        acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
+        save_state()
         return False
 
     msgs.sort(key=lambda m: m.id, reverse=True)
@@ -588,6 +699,8 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         print("❌ Aucune tâche trouvée dans les nouveaux messages")
         for i, m in enumerate(msgs[:6]):
             print(f"Message {i} (ID:{m.id}): {(m.message or '')[:120]}")
+        acc_state["consecutive_errors"] = 0
+        save_state()
         return False
 
     print(f"🔍 Analyse du message (id {last_task_msg.id}):")
@@ -612,39 +725,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
 
         action, link, comment_text_from_message = parse_task_message(text)
 
-        # # si message semble être un texte isolé -> chercher bloc tâche précédent (comment only)
-        # if not action and not link:
-        #     print("🔎 Message sans bloc tâche -> possible texte de commentaire isolé -> recherche du bloc précédent")
-        #     prev_task = await find_prev_task_before_message(client, BOT_USERNAME, last_msg.id, baseline_id=baseline_id, lookback=60, require_comment=True)
-        #     if prev_task:
-        #         print(f"✅ Bloc tâche précédent trouvé (id {prev_task.id}) -> association et traitement")
-        #         action, link, inline_comment = parse_task_message(prev_task.message or "")
-        #         comment_text = inline_comment if inline_comment else (last_msg.message or "").strip()
-        #         cl = INSTA_SESSIONS.get(username) or get_ig_session(username)
-        #         if not cl:
-        #             print("⚠️ Pas de session IG valide -> envoi ❌Skip")
-        #             await send_with_retry(client, BOT_USERNAME, "❌Skip")
-        #         else:
-        #             ok = do_instagram_action(cl, action, link, comment_text)
-        #             if ok:
-        #                 await send_with_retry(client, BOT_USERNAME, "✅Completed")
-        #                 print("✅ Completed envoyé (via commentaire isolé)")
-        #                 task_done_on_this_account += 1
-        #                 save_last_account(username)
-        #             else:
-        #                 await send_with_retry(client, BOT_USERNAME, "❌Skip")
-        #                 print("⏭️ Skip envoyé (échec action via commentaire isolé)")
-        #         nxt = await wait_next_bot_message(client, BOT_USERNAME, prev_task.id, timeout_sec=12)
-        #         if not nxt:
-        #             print("⌛️ Pas de nouveau message -> sortie du compte")
-        #             break
-        #         last_msg = nxt
-        #         continue
-        #     else:
-        #         print("ℹ️ Aucun bloc tâche commentaire trouvé -> sortie du compte")
-        #         return False
-
-        # si action+link -> exécuter (possiblement comment)
         if action and link:
             comment_text = None
             if "comment" in action.lower() or "leave the comment" in action.lower():
@@ -665,16 +745,32 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             if not cl:
                 print("⚠️ Pas de session IG valide -> envoi ❌Skip")
                 await send_with_retry(client, BOT_USERNAME, "❌Skip")
+                # mark skip in persistent state if repeated failures
+                acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
+                if acc_state["consecutive_errors"] >= 3:
+                    acc_state["skip_until"] = time.time() + SKIP_DURATION
+                    print(f"⏭️ {username} marqué skip pour {SKIP_DURATION//60} minutes (persistant)")
+                save_state()
             else:
-                ok = do_instagram_action(cl, action, link, comment_text)
+                ok = await do_instagram_action(cl, action, link, comment_text)
                 if ok:
                     await send_with_retry(client, BOT_USERNAME, "✅Completed")
                     print("✅ Completed envoyé")
                     task_done_on_this_account += 1
                     save_last_account(username)
+                    acc_state["consecutive_errors"] = 0
+                    acc_state["last_msg_id"] = max(acc_state.get("last_msg_id", 0), last_msg.id)
+                    save_state()
                 else:
                     await send_with_retry(client, BOT_USERNAME, "❌Skip")
                     print("⏭️ Skip envoyé (échec action)")
+                    acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
+                    if acc_state["consecutive_errors"] >= 3:
+                        acc_state["skip_until"] = time.time() + SKIP_DURATION
+                        print(f"⏭️ {username} marqué skip pour {SKIP_DURATION//60} minutes (persistant)")
+                    # still save last_msg_id to avoid infinite loop on same message
+                    acc_state["last_msg_id"] = max(acc_state.get("last_msg_id", 0), last_msg.id)
+                    save_state()
 
             nxt = await wait_next_bot_message(client, BOT_USERNAME, last_msg.id, timeout_sec=15)
             if not nxt:
@@ -693,6 +789,7 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
     if task_done_on_this_account >= MAX_TASKS_PER_ACCOUNT:
         print(f"⚠️ Limite locale atteinte ({MAX_TASKS_PER_ACCOUNT}) pour {username}")
 
+    save_state()
     return True
 
 
@@ -703,10 +800,10 @@ async def initialize_instagram_sessions():
     print("🔄 Initialisation des sessions Instagram...")
     for account in INSTA_ACCOUNTS:
         username = account["username"]
-        if username in SKIP_ACCOUNTS:
-            skip_time = SKIP_ACCOUNTS[username]
-            remaining = int((SKIP_DURATION - (time.time() - skip_time)) / 60)
-            print(f"⏭️ Compte {username} skipé ({remaining} minutes)")
+        acc_state = ensure_account_state(username)
+        if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
+            remaining = int((acc_state["skip_until"] - time.time()) / 60)
+            print(f"⏭️ Compte {username} skipé ({remaining} minutes restants)")
             continue
         print(f"🔗 Connexion à Instagram: {username}")
         get_ig_session(username)
@@ -717,6 +814,7 @@ async def initialize_instagram_sessions():
 # BOUCLE PRINCIPALE
 # ======================
 async def main():
+    load_state()
     client = TelegramClient("tg_session", API_ID, API_HASH)
     await client.start()
     print("✅ Connecté à Telegram")
@@ -751,9 +849,10 @@ async def main():
             username = INSTA_ACCOUNTS[idx]["username"]
             print(f"\n=== Vérification du compte {username} ({idx+1}/{len(INSTA_ACCOUNTS)}) ===")
 
-            if username in SKIP_ACCOUNTS:
-                skip_time = SKIP_ACCOUNTS[username]
-                remaining = int((SKIP_DURATION - (time.time() - skip_time)) / 60)
+            acc_state = ensure_account_state(username)
+            # skip if persistent skip set
+            if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
+                remaining = int((acc_state["skip_until"] - time.time()) / 60)
                 print(f"⏭️ Compte {username} skipé ({remaining} minutes)")
                 idx = (idx + 1) % len(INSTA_ACCOUNTS)
                 continue
@@ -768,6 +867,11 @@ async def main():
                 consecutive_errors += 1
                 print(f"⚠️ Erreur durant traitement {username}: {e}")
                 await asyncio.sleep(2)
+                acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
+                if acc_state["consecutive_errors"] >= 5:
+                    acc_state["skip_until"] = time.time() + SKIP_DURATION
+                    print(f"⏭️ {username} marqué skip (persistant) après erreurs répétées")
+                save_state()
 
             use_tasks_command = False
             idx = (idx + 1) % len(INSTA_ACCOUNTS)
