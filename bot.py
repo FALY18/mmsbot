@@ -5,6 +5,7 @@ import re
 import time
 import random
 import os
+import subprocess
 from urllib.parse import urlparse
 from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime
@@ -19,19 +20,20 @@ from instagrapi.exceptions import (
 )
 
 # ======================
-# CONFIG TELEGRAM (à adapter si besoin)
+# CONFIG TELEGRAM
 # ======================
-API_ID = 21297856 # <-- Mets ton api_id
-API_HASH = "8a3d43dd2986184eb75aecc220b735d3" # <-- Mets ton api_hash
+API_ID = 21297856
+API_HASH = "8xxxxxxxxxxxxxxxx20b735d3"
 BOT_USERNAME = "@SmmKingdomTasksBot"
 
 # ======================
-# CONFIGURATION
+# CONFIGURATION AMÉLIORÉE
 # ======================
-MAX_RETRIES = 3
-REQUEST_DELAY = (0.5, 1.5)
-ACTION_DELAY = (0.5, 2.0)
-MAX_TASKS_PER_ACCOUNT = 20
+MAX_RETRIES = 2
+REQUEST_DELAY = (3.0, 6.0)  # Délais augmentés
+ACTION_DELAY = (5.0, 10.0)  # Délais d'action augmentés
+ACCOUNT_SWITCH_DELAY = (30.0, 60.0)  # Délai entre les comptes
+MAX_TASKS_PER_ACCOUNT = 10  # Réduit pour éviter la détection
 
 # Fenêtre pour accepter "tâches existantes" au démarrage (en secondes).
 EXISTING_TASK_WINDOW_SECONDS = 120
@@ -56,13 +58,51 @@ INSTA_PASSWORDS = {a["username"]: a["password"] for a in INSTA_ACCOUNTS}
 INSTA_SESSIONS: Dict[str, InstaClient] = {}
 
 SKIP_ACCOUNTS: dict[str, float] = {}
-SKIP_DURATION = 3600
+SKIP_DURATION = 7200  # 2 heures pour les comptes problématiques
 
 # persistent state for tasks/accounts to avoid skipping/reprocessing
 STATE: Dict[str, Any] = {
     "accounts": {}  # username -> { last_msg_id, skip_until, consecutive_errors }
 }
 
+# ======================
+# CONFIGURATIONS DEVICE VARIÉES
+# ======================
+DEVICE_CONFIGS = [
+    {
+        "app_version": "200.0.0.30.128",
+        "android_version": 26,
+        "android_release": "8.0.0",
+        "dpi": "480dpi",
+        "resolution": "1080x1920",
+        "manufacturer": "samsung",
+        "device": "SM-G935F",
+        "model": "herolte",
+        "cpu": "samsungexynos8890"
+    },
+    {
+        "app_version": "200.0.0.30.128",
+        "android_version": 29,
+        "android_release": "10.0.0",
+        "dpi": "420dpi",
+        "resolution": "1080x2280",
+        "manufacturer": "google",
+        "device": "Pixel 4",
+        "model": "pixel4",
+        "cpu": "qualcomm"
+    },
+    {
+        "app_version": "200.0.0.30.128",
+        "android_version": 28,
+        "android_release": "9.0.0",
+        "dpi": "440dpi",
+        "resolution": "1440x2880",
+        "manufacturer": "samsung",
+        "device": "SM-G960F",
+        "model": "starlte",
+        "cpu": "samsungexynos9810"
+    }
+]
 
 # ======================
 # STATE PERSISTENCE
@@ -91,6 +131,65 @@ def ensure_account_state(username: str):
         acc[username] = {"last_msg_id": 0, "skip_until": 0, "consecutive_errors": 0}
     return acc[username]
 
+# ======================
+# ROTATION IP & RÉPARATION
+# ======================
+async def rotate_ip():
+    """Tente de changer l'adresse IP"""
+    print("🔄 Tentative de rotation d'IP...")
+    try:
+        # Méthode 1: Redémarrer le WiFi via Termux
+        result1 = subprocess.run(["termux-wifi-enable", "false"], 
+                               capture_output=True, text=True, timeout=10)
+        await asyncio.sleep(5)
+        result2 = subprocess.run(["termymux-wifi-enable", "true"], 
+                               capture_output=True, text=True, timeout=10)
+        print("✅ WiFi redémarré")
+        await asyncio.sleep(10)
+        return True
+    except Exception as e:
+        print(f"⚠️ Rotation IP WiFi échouée: {e}")
+    
+    try:
+        # Méthode 2: Redémarrer les données mobiles
+        subprocess.run(["termux-telephony-call", "*#*#4636#*#*"], 
+                      timeout=10)  # Menu test Android
+        await asyncio.sleep(5)
+        print("📱 Données mobiles redémarrées")
+        return True
+    except Exception as e:
+        print(f"⚠️ Rotation IP données mobiles échouée: {e}")
+    
+    # Méthode 3: Attendre simplement
+    wait_time = random.randint(300, 600)  # 5-10 minutes
+    print(f"⏳ Attente de {wait_time//60} minutes pour changement IP naturel...")
+    await asyncio.sleep(wait_time)
+    return True
+
+async def repair_instagram_session(username: str):
+    """Tente de réparer une session Instagram problématique"""
+    print(f"🔧 Tentative de réparation pour {username}...")
+    
+    # Rotation d'IP d'abord
+    await rotate_ip()
+    
+    # Attendre avant nouvelle tentative
+    await asyncio.sleep(random.randint(60, 120))
+    
+    # Nettoyer la session existante
+    if username in INSTA_SESSIONS:
+        del INSTA_SESSIONS[username]
+    
+    # Supprimer le fichier de session
+    session_file = f"session_{username}.json"
+    if os.path.exists(session_file):
+        try:
+            os.remove(session_file)
+            print(f"🗑️ Session {username} nettoyée")
+        except:
+            pass
+    
+    return True
 
 # ======================
 # UTILITAIRES TELEGRAM
@@ -196,7 +295,7 @@ def contains_emoji(s: str) -> bool:
 
 
 # ======================
-# Collecte rapide du texte de commentaire (maintenant accepte emoji-only)
+# Collecte rapide du texte de commentaire
 # ======================
 async def fast_collect_comment_text(client: TelegramClient, bot: str, after_id: int, timeout_sec: int = 20) -> Optional[str]:
     start = time.time()
@@ -277,11 +376,20 @@ def parse_task_message(text: str) -> Tuple[Optional[str], Optional[str], Optiona
 
 
 # ======================
-# ERREURS IG
+# ERREURS IG AMÉLIORÉES
 # ======================
 def handle_instagram_error(username: str, error: Exception) -> bool:
     error_msg = str(error).lower()
     acc_state = ensure_account_state(username)
+    
+    # IP Blacklist - traitement spécial
+    if any(x in error_msg for x in ["blacklist", "black list", "ip address", "change your ip"]):
+        skip_until = time.time() + SKIP_DURATION
+        acc_state["skip_until"] = skip_until
+        save_state()
+        print(f"🚨 IP Blacklist détectée pour {username} - skip jusqu'à {datetime.utcfromtimestamp(skip_until)}")
+        return False
+    
     # on challenge ou vérification -> skip durable
     if any(x in error_msg for x in ["challenge", "phone", "sms", "verify", "confirmation", "checkpoint"]):
         skip_until = time.time() + SKIP_DURATION
@@ -289,15 +397,18 @@ def handle_instagram_error(username: str, error: Exception) -> bool:
         save_state()
         print(f"❌ Challenge requis pour {username} - skip jusqu'à {datetime.utcfromtimestamp(skip_until)}")
         return False
+    
     # throttling / wait messages -> backoff + skip short
     if any(x in error_msg for x in ["wait", "minutes", "temporarily", "temporary", "try again later"]):
-        acc_state["skip_until"] = time.time() + 300  # 5 minutes
+        acc_state["skip_until"] = time.time() + 600  # 10 minutes
         save_state()
-        print(f"⏳ Attente requise pour {username} - skip 5 minutes")
+        print(f"⏳ Attente requise pour {username} - skip 10 minutes")
         return False
+    
     if any(x in error_msg for x in ["problem with your request", "request", "connection", "network"]):
         print(f"⚠️ Problème réseau pour {username} - réessayer plus tard")
         return True
+    
     print(f"⚠️ Erreur IG inconnue pour {username}: {error_msg[:120]} - réessayer plus tard")
     return True
 
@@ -338,7 +449,7 @@ def load_last_account() -> Optional[str]:
 
 
 # ======================
-# SESSIONS INSTAGRAM
+# SESSIONS INSTAGRAM AMÉLIORÉES
 # ======================
 def get_ig_session(username: str) -> Optional[InstaClient]:
     acc_state = ensure_account_state(username)
@@ -371,21 +482,19 @@ def get_ig_session(username: str) -> Optional[InstaClient]:
         cl.set_country("FR")
         cl.set_country_code(33)
         cl.set_timezone_offset(3600)
-        cl.set_device({
-            "app_version": "200.0.0.30.128",
-            "android_version": 26,
-            "android_release": "8.0.0",
-            "dpi": "480dpi",
-            "resolution": "1080x1920",
-            "manufacturer": "samsung",
-            "device": "SM-G935F",
-            "model": "herolte",
-            "cpu": "samsungexynos8890"
-        })
+        
+        # Device info aléatoire
+        device = random.choice(DEVICE_CONFIGS)
+        cl.set_device(device)
+        
         try:
             cl.load_settings(f"session_{username}.json")
         except:
             pass
+        
+        # Délai avant connexion
+        time.sleep(random.uniform(5, 15))
+        
         cl.login(username, pwd)
         cl.dump_settings(f"session_{username}.json")
         INSTA_SESSIONS[username] = cl
@@ -401,12 +510,38 @@ def get_ig_session(username: str) -> Optional[InstaClient]:
         return None
 
 
+async def safe_instagram_action(cl: InstaClient, action: str, link: str, comment_text: Optional[str], username: str) -> bool:
+    """Version sécurisée des actions Instagram avec gestion d'erreurs améliorée"""
+    max_retries = 2
+    base_delay = 30
+    
+    for attempt in range(max_retries):
+        try:
+            return await do_instagram_action(cl, action, link, comment_text)
+        except Exception as e:
+            error_msg = str(e).lower()
+            print(f"⚠️ Tentative {attempt+1} échouée pour {username}: {e}")
+            
+            if "blacklist" in error_msg or "ip" in error_msg:
+                print("🚨 IP blacklistée détectée - réparation...")
+                await repair_instagram_session(username)
+            elif "wait" in error_msg or "minutes" in error_msg:
+                wait_time = base_delay * (attempt + 1)
+                print(f"⏳ Attente de {wait_time} secondes")
+                await asyncio.sleep(wait_time)
+            else:
+                await asyncio.sleep(base_delay)
+    
+    return False
+
+
 async def do_instagram_action(cl: InstaClient, action: str, link: str, comment_text: Optional[str]) -> bool:
     print(f"🛠️ Tentative d'action: {action} sur {link}")
     for attempt in range(3):
         try:
             a_low = (action or "").lower()
             await asyncio.sleep(random.uniform(*ACTION_DELAY))
+            
             if "follow" in a_low:
                 target = normalize_instagram_profile(link)
                 if not target:
@@ -427,7 +562,6 @@ async def do_instagram_action(cl: InstaClient, action: str, link: str, comment_t
                         return True
                     except Exception as e2:
                         print(f"❌ Follow fallback erreur: {e2}")
-                        # certain errors indicate account problems
                         handle_instagram_error(getattr(cl, "username", "unknown"), e2)
                         return False
 
@@ -453,7 +587,7 @@ async def do_instagram_action(cl: InstaClient, action: str, link: str, comment_t
         except FeedbackRequired as e:
             print(f"❌ FeedbackRequired: {e}")
             if attempt == 0:
-                await asyncio.sleep(3)
+                await asyncio.sleep(10)
                 continue
             else:
                 return False
@@ -471,17 +605,16 @@ async def do_instagram_action(cl: InstaClient, action: str, link: str, comment_t
         except Exception as e:
             print(f"❌ Erreur action IG: {e}")
             if attempt == 0:
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
                 continue
             else:
-                # escalate unknown errors to handler to possibly mark skip
                 handle_instagram_error(getattr(cl, "username", "unknown"), e)
                 return False
     return False
 
 
 # ======================
-# Recherche du bloc tâche précédent (entre baseline_id et after_msg_id)
+# Recherche du bloc tâche précédent
 # ======================
 async def find_prev_task_before_message(
     client: TelegramClient,
@@ -541,7 +674,6 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
 
             print(f"✅ Tâche existante détectée (ID: {msg.id})")
 
-            # essayer d'identifier le compte lié
             username_found = None
             async for prev in client.iter_messages(BOT_USERNAME, limit=30, max_id=msg.id - 1):
                 if not prev.message:
@@ -586,13 +718,12 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
                 await send_with_retry(client, BOT_USERNAME, "❌Skip")
                 continue
 
-            ok = await do_instagram_action(cl, action, link, comment_text)
+            ok = await safe_instagram_action(cl, action, link, comment_text, username_found)
             if ok:
                 await send_with_retry(client, BOT_USERNAME, "✅Completed")
                 print("✅ Completed envoyé pour la tâche existante")
                 save_last_account(username_found)
                 any_processed = True
-                # update persistent state: last_msg_id processed
                 acc = ensure_account_state(username_found)
                 acc["last_msg_id"] = max(acc.get("last_msg_id", 0), msg.id)
                 save_state()
@@ -619,7 +750,6 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
 # ======================
 async def process_account(client: TelegramClient, username: str, use_tasks_command: bool) -> bool:
     acc_state = ensure_account_state(username)
-    # skip if persistent skip_until in future
     if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
         remaining = int((acc_state["skip_until"] - time.time()) / 60)
         print(f"⏭️ Compte {username} skipé (persistant, {remaining} minutes restants)")
@@ -634,7 +764,7 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         print("➡️ Envoyé: 📝Tasks📝")
         await asyncio.sleep(0.8)
 
-    # baseline avant 'Instagram' - utiliser last_msg_id si présent pour éviter reprocess
+    # baseline avant 'Instagram'
     try:
         baseline_list = await client.get_messages(BOT_USERNAME, limit=1)
         baseline_id = baseline_list[0].id if baseline_list else 0
@@ -642,7 +772,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         print(f"⚠️ Erreur récupération baseline id: {e}")
         baseline_id = 0
 
-    # If we have a saved last_msg_id, use it as baseline to not reprocess older messages
     saved_last = acc_state.get("last_msg_id", 0)
     if saved_last and saved_last > baseline_id:
         baseline_id = saved_last
@@ -663,7 +792,7 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
         return False
     print(f"➡️ Sélection du compte: {username}")
 
-    # attendre réponse : 5s -> réessayer (resend username) -> wait 10s -> sinon next account
+    # attendre réponse
     response = await wait_next_bot_message(client, BOT_USERNAME, baseline_id, timeout_sec=5)
     if not response:
         print(f"⚠️ Pas de réponse après 5s suite à envoi username {username} -> réessai dans 10s")
@@ -745,14 +874,13 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             if not cl:
                 print("⚠️ Pas de session IG valide -> envoi ❌Skip")
                 await send_with_retry(client, BOT_USERNAME, "❌Skip")
-                # mark skip in persistent state if repeated failures
                 acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
                 if acc_state["consecutive_errors"] >= 3:
                     acc_state["skip_until"] = time.time() + SKIP_DURATION
                     print(f"⏭️ {username} marqué skip pour {SKIP_DURATION//60} minutes (persistant)")
                 save_state()
             else:
-                ok = await do_instagram_action(cl, action, link, comment_text)
+                ok = await safe_instagram_action(cl, action, link, comment_text, username)
                 if ok:
                     await send_with_retry(client, BOT_USERNAME, "✅Completed")
                     print("✅ Completed envoyé")
@@ -768,7 +896,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
                     if acc_state["consecutive_errors"] >= 3:
                         acc_state["skip_until"] = time.time() + SKIP_DURATION
                         print(f"⏭️ {username} marqué skip pour {SKIP_DURATION//60} minutes (persistant)")
-                    # still save last_msg_id to avoid infinite loop on same message
                     acc_state["last_msg_id"] = max(acc_state.get("last_msg_id", 0), last_msg.id)
                     save_state()
 
@@ -779,7 +906,6 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             last_msg = nxt
             continue
 
-        # cas défaut -> attendre suivant
         nxt = await wait_next_bot_message(client, BOT_USERNAME, last_msg.id, timeout_sec=10)
         if not nxt:
             print("ℹ️ Rien de pertinent reçu -> sortie du compte")
@@ -794,10 +920,12 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
 
 
 # ======================
-# INITIALISATION SESSIONS
+# INITIALISATION SESSIONS AMÉLIORÉE
 # ======================
 async def initialize_instagram_sessions():
     print("🔄 Initialisation des sessions Instagram...")
+    successful_sessions = 0
+    
     for account in INSTA_ACCOUNTS:
         username = account["username"]
         acc_state = ensure_account_state(username)
@@ -805,13 +933,23 @@ async def initialize_instagram_sessions():
             remaining = int((acc_state["skip_until"] - time.time()) / 60)
             print(f"⏭️ Compte {username} skipé ({remaining} minutes restants)")
             continue
+        
         print(f"🔗 Connexion à Instagram: {username}")
-        get_ig_session(username)
-    print(f"✅ {len(INSTA_SESSIONS)} sessions Instagram initialisées")
+        session = get_ig_session(username)
+        if session:
+            successful_sessions += 1
+        
+        # Délai entre les connexions pour éviter la détection
+        if successful_sessions < len(INSTA_ACCOUNTS):
+            delay = random.uniform(10, 30)
+            print(f"⏳ Attente de {delay:.1f}s avant prochaine connexion...")
+            await asyncio.sleep(delay)
+    
+    print(f"✅ {successful_sessions}/{len(INSTA_ACCOUNTS)} sessions Instagram initialisées")
 
 
 # ======================
-# BOUCLE PRINCIPALE
+# BOUCLE PRINCIPALE AMÉLIORÉE
 # ======================
 async def main():
     load_state()
@@ -834,15 +972,14 @@ async def main():
     idx = 0
     consecutive_errors = 0
     max_errors_before_pause = 3
-    # si on a traité une tâche existante -> on commence directement par "Instagram" sans renvoyer "📝Tasks📝"
     use_tasks_command = not task_processed
 
     try:
         while True:
             cleanup_skip_list()
             if consecutive_errors >= max_errors_before_pause:
-                print("⚠️ Trop d'erreurs consécutives -> pause 5s")
-                await asyncio.sleep(5)
+                print("⚠️ Trop d'erreurs consécutives -> pause 5 minutes")
+                await asyncio.sleep(300)
                 consecutive_errors = 0
                 use_tasks_command = True
 
@@ -850,7 +987,6 @@ async def main():
             print(f"\n=== Vérification du compte {username} ({idx+1}/{len(INSTA_ACCOUNTS)}) ===")
 
             acc_state = ensure_account_state(username)
-            # skip if persistent skip set
             if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
                 remaining = int((acc_state["skip_until"] - time.time()) / 60)
                 print(f"⏭️ Compte {username} skipé ({remaining} minutes)")
@@ -875,10 +1011,13 @@ async def main():
 
             use_tasks_command = False
             idx = (idx + 1) % len(INSTA_ACCOUNTS)
+            
+            # Délai entre les comptes
             if idx == 0:
-                print("🔄 Fin de tour -> on recommence depuis le premier compte avec 'Instagram'")
-
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+                print("🔄 Fin de tour -> pause avant nouveau cycle")
+                await asyncio.sleep(random.uniform(60, 120))
+            else:
+                await asyncio.sleep(random.uniform(*ACCOUNT_SWITCH_DELAY))
 
     except KeyboardInterrupt:
         print("\n⏹️ Arrêt demandé")
