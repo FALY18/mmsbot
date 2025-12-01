@@ -23,7 +23,7 @@ from instagrapi.exceptions import (
 # CONFIG TELEGRAM
 # ======================
 API_ID = 21297856
-API_HASH = "8xxxxxxxxxxxxxxxx20b735d3"
+API_HASH = "8a3d43dd2986184eb75aecc220b735d3"
 BOT_USERNAME = "@SmmKingdomTasksBot"
 
 # ======================
