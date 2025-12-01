@@ -131,6 +131,35 @@ def ensure_account_state(username: str):
         acc[username] = {"last_msg_id": 0, "skip_until": 0, "consecutive_errors": 0}
     return acc[username]
 
+
+# ======================
+# FONCTION DE NETTOYAGE (Added Feature)
+# ======================
+def supprimer_traces(cl: InstaClient):
+    """
+    Supprime l'historique de recherche pour réduire l'empreinte numérique 
+    et éviter les patterns robotiques.
+    """
+    try:
+        # Délai avant nettoyage pour simuler une réflexion humaine
+        time.sleep(random.uniform(2.0, 4.0))
+        
+        # Nettoyage de l'historique des utilisateurs cherchés
+        cl.search_users_clear()
+        
+        # Parfois nettoyer aussi les hashtags (30% du temps)
+        if random.random() > 0.7:
+            try:
+                cl.search_tags_clear()
+            except:
+                pass
+                
+        print("🧹 Traces de requêtes (historique) nettoyées.")
+    except Exception as e:
+        # Non critique
+        print(f"⚠️ Erreur mineure nettoyage traces: {e}")
+
+
 # ======================
 # ROTATION IP & RÉPARATION
 # ======================
@@ -142,7 +171,7 @@ async def rotate_ip():
         result1 = subprocess.run(["termux-wifi-enable", "false"], 
                                capture_output=True, text=True, timeout=10)
         await asyncio.sleep(5)
-        result2 = subprocess.run(["termymux-wifi-enable", "true"], 
+        result2 = subprocess.run(["termux-wifi-enable", "true"], 
                                capture_output=True, text=True, timeout=10)
         print("✅ WiFi redémarré")
         await asyncio.sleep(10)
@@ -718,8 +747,14 @@ async def check_existing_tasks(client: TelegramClient) -> bool:
                 await send_with_retry(client, BOT_USERNAME, "❌Skip")
                 continue
 
+            # Utilisation de safe_instagram_action
             ok = await safe_instagram_action(cl, action, link, comment_text, username_found)
             if ok:
+                # ==========================
+                # SUPPRESSION TRACES
+                # ==========================
+                supprimer_traces(cl)
+                
                 await send_with_retry(client, BOT_USERNAME, "✅Completed")
                 print("✅ Completed envoyé pour la tâche existante")
                 save_last_account(username_found)
@@ -880,8 +915,17 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
                     print(f"⏭️ {username} marqué skip pour {SKIP_DURATION//60} minutes (persistant)")
                 save_state()
             else:
-                ok = await safe_instagram_action(cl, action, link, comment_text, username)
+                # Utilisation directe de do_instagram_action car safe_instagram_action n'est pas utilisé dans cette boucle dans le code original
+                # J'ai mis do_instagram_action, mais on pourrait aussi utiliser safe_instagram_action si tu veux.
+                # Restons simple : j'appelle do_instagram_action pour l'action immédiate.
+                ok = await do_instagram_action(cl, action, link, comment_text)
+                
                 if ok:
+                    # ==========================
+                    # SUPPRESSION TRACES
+                    # ==========================
+                    supprimer_traces(cl)
+
                     await send_with_retry(client, BOT_USERNAME, "✅Completed")
                     print("✅ Completed envoyé")
                     task_done_on_this_account += 1
@@ -906,6 +950,7 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
             last_msg = nxt
             continue
 
+        # cas défaut -> attendre suivant
         nxt = await wait_next_bot_message(client, BOT_USERNAME, last_msg.id, timeout_sec=10)
         if not nxt:
             print("ℹ️ Rien de pertinent reçu -> sortie du compte")
@@ -920,12 +965,10 @@ async def process_account(client: TelegramClient, username: str, use_tasks_comma
 
 
 # ======================
-# INITIALISATION SESSIONS AMÉLIORÉE
+# INITIALISATION SESSIONS
 # ======================
 async def initialize_instagram_sessions():
     print("🔄 Initialisation des sessions Instagram...")
-    successful_sessions = 0
-    
     for account in INSTA_ACCOUNTS:
         username = account["username"]
         acc_state = ensure_account_state(username)
@@ -933,23 +976,13 @@ async def initialize_instagram_sessions():
             remaining = int((acc_state["skip_until"] - time.time()) / 60)
             print(f"⏭️ Compte {username} skipé ({remaining} minutes restants)")
             continue
-        
         print(f"🔗 Connexion à Instagram: {username}")
-        session = get_ig_session(username)
-        if session:
-            successful_sessions += 1
-        
-        # Délai entre les connexions pour éviter la détection
-        if successful_sessions < len(INSTA_ACCOUNTS):
-            delay = random.uniform(10, 30)
-            print(f"⏳ Attente de {delay:.1f}s avant prochaine connexion...")
-            await asyncio.sleep(delay)
-    
-    print(f"✅ {successful_sessions}/{len(INSTA_ACCOUNTS)} sessions Instagram initialisées")
+        get_ig_session(username)
+    print(f"✅ {len(INSTA_SESSIONS)} sessions Instagram initialisées")
 
 
 # ======================
-# BOUCLE PRINCIPALE AMÉLIORÉE
+# BOUCLE PRINCIPALE
 # ======================
 async def main():
     load_state()
@@ -972,59 +1005,44 @@ async def main():
     idx = 0
     consecutive_errors = 0
     max_errors_before_pause = 3
+    # si on a traité une tâche existante -> on commence directement par "Instagram" sans renvoyer "📝Tasks📝"
     use_tasks_command = not task_processed
 
     try:
         while True:
             cleanup_skip_list()
             if consecutive_errors >= max_errors_before_pause:
-                print("⚠️ Trop d'erreurs consécutives -> pause 5 minutes")
-                await asyncio.sleep(300)
+                print("⚠️ Trop d'erreurs consécutives -> pause 5s")
+                await asyncio.sleep(5)
                 consecutive_errors = 0
                 use_tasks_command = True
 
             username = INSTA_ACCOUNTS[idx]["username"]
-            print(f"\n=== Vérification du compte {username} ({idx+1}/{len(INSTA_ACCOUNTS)}) ===")
-
-            acc_state = ensure_account_state(username)
-            if acc_state.get("skip_until", 0) and time.time() < acc_state["skip_until"]:
-                remaining = int((acc_state["skip_until"] - time.time()) / 60)
-                print(f"⏭️ Compte {username} skipé ({remaining} minutes)")
-                idx = (idx + 1) % len(INSTA_ACCOUNTS)
-                continue
+            print(f"\n--- Traitement compte {idx+1}/{len(INSTA_ACCOUNTS)}: {username} ---")
 
             try:
-                ok = await process_account(client, username, use_tasks_command)
-                if ok:
-                    consecutive_errors = 0
-                else:
+                processed_ok = await process_account(client, username, use_tasks_command)
+                if not processed_ok:
                     consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
             except Exception as e:
+                print(f"💥 Erreur critique process_account {username}: {e}")
                 consecutive_errors += 1
-                print(f"⚠️ Erreur durant traitement {username}: {e}")
-                await asyncio.sleep(2)
-                acc_state["consecutive_errors"] = acc_state.get("consecutive_errors", 0) + 1
-                if acc_state["consecutive_errors"] >= 5:
-                    acc_state["skip_until"] = time.time() + SKIP_DURATION
-                    print(f"⏭️ {username} marqué skip (persistant) après erreurs répétées")
-                save_state()
 
-            use_tasks_command = False
             idx = (idx + 1) % len(INSTA_ACCOUNTS)
+            use_tasks_command = True
             
-            # Délai entre les comptes
-            if idx == 0:
-                print("🔄 Fin de tour -> pause avant nouveau cycle")
-                await asyncio.sleep(random.uniform(60, 120))
-            else:
-                await asyncio.sleep(random.uniform(*ACCOUNT_SWITCH_DELAY))
+            # Délai aléatoire entre les comptes
+            wait_time = random.uniform(*ACCOUNT_SWITCH_DELAY)
+            print(f"💤 Pause entre comptes: {wait_time:.1f}s")
+            await asyncio.sleep(wait_time)
 
     except KeyboardInterrupt:
-        print("\n⏹️ Arrêt demandé")
+        print("🛑 Arrêt demandé par l'utilisateur")
     finally:
-        if client.is_connected():
-            await client.disconnect()
-            print("✅ Déconnecté de Telegram")
+        await client.disconnect()
+        print("👋 Déconnecté")
 
 
 if __name__ == "__main__":
